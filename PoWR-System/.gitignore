@@ -1,0 +1,64 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# Environment variables
+.env
+.env.local
+.env*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Testing
+coverage/
+.nyc_output/
+
+# Misc
+*.pem
+.cache/
+
+# Database
+data/
+*.db
+*.db-shm
+*.db-wal
+
+
+
+
+# AI Logs (contain sensitive info)
+ai_logs/droid_factory_ai/
+ai_logs/sensitive/
+
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
+
+# Scratch / temp files
+backend/history.txt
+
+# Clarinet network configs that contain mnemonics — never commit
+settings/Testnet.toml
+settings/Mainnet.toml

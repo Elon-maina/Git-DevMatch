@@ -1,0 +1,103 @@
+// Force IPv4 DNS resolution — required in WSL2 where IPv6 is unreachable
+import dns from "dns";
+dns.setDefaultResultOrder("ipv4first");
+
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+// Middleware
+const allowedOrigins = [
+  "http://localhost:3000",
+  process.env.FRONTEND_URL?.replace(/\/$/, ""),
+].filter(Boolean);
+
+console.log("Allowed origins at startup:", allowedOrigins); 
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, curl, etc)
+    if (!origin) return callback(null, true);
+    // Check if origin is allowed (strip trailing slash for comparison)
+    const normalizedOrigin = origin.replace(/\/$/, "");
+    if (allowedOrigins.some(allowed => allowed === normalizedOrigin)) {
+      return callback(null, origin);
+    }
+    callback(new Error("Not allowed by CORS"));
+  },
+  credentials: true,
+}));
+app.use(express.json());
+
+// Health check
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+// DB health check — hit this in browser to diagnose connection issues
+app.get("/health/db", async (req, res) => {
+  try {
+    const { Pool } = await import("pg");
+    const pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.DATABASE_URL?.includes("sslmode=require")
+        ? { rejectUnauthorized: false }
+        : false,
+      connectionTimeoutMillis: 5000,
+    });
+    const result = await pool.query("SELECT NOW() as time");
+    await pool.end();
+    res.json({
+      status: "ok",
+      db_time: result.rows[0].time,
+      database_url_set: !!process.env.DATABASE_URL,
+      github_client_id_set: !!process.env.GITHUB_CLIENT_ID,
+      github_client_secret_set: !!process.env.GITHUB_CLIENT_SECRET,
+      frontend_url: process.env.FRONTEND_URL || "(not set — defaults to localhost:3000)",
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      status: "error",
+      error: err.message,
+      database_url_set: !!process.env.DATABASE_URL,
+      github_client_id_set: !!process.env.GITHUB_CLIENT_ID,
+      github_client_secret_set: !!process.env.GITHUB_CLIENT_SECRET,
+      frontend_url: process.env.FRONTEND_URL || "(not set)",
+    });
+  }
+});
+
+// Routes
+import authRoutes from "./routes/auth";
+import userRoutes from "./routes/user";
+import subscriptionRoutes from "./routes/subscription";
+import paymentRoutes from "./routes/payments";
+import webhookRoutes from "./routes/webhooks";
+import systemRoutes from "./routes/system";
+import recruiterRoutes from "./routes/recruiter";
+import badgeRoutes from "./routes/badges";
+import jobsRouter from "./routes/jobs";
+
+app.use("/api/auth", authRoutes);
+app.use("/api/user", userRoutes);
+app.use("/api/subscription", subscriptionRoutes);
+app.use("/api/payments", paymentRoutes);
+app.use("/api/webhooks", webhookRoutes);
+app.use("/api/system", systemRoutes);
+app.use("/api/recruiter", recruiterRoutes);
+app.use("/api/badges", badgeRoutes);
+app.use("/api", jobsRouter);
+
+// Start scheduler service
+import { schedulerService } from "./services/schedulerService";
+schedulerService.start();
+
+app.listen(PORT, () => {
+  console.log(`Backend server running on port ${PORT}`);
+});
+
