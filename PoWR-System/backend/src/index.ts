@@ -42,19 +42,11 @@ app.get("/health", (req, res) => {
 // DB health check — hit this in browser to diagnose connection issues
 app.get("/health/db", async (req, res) => {
   try {
-    const { Pool } = await import("pg");
-    const pool = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: process.env.DATABASE_URL?.includes("sslmode=require")
-        ? { rejectUnauthorized: false }
-        : false,
-      connectionTimeoutMillis: 5000,
-    });
-    const result = await pool.query("SELECT NOW() as time");
-    await pool.end();
+    const { dbService } = await import("./services/database");
+    const dbTime = await dbService.ping();
     res.json({
       status: "ok",
-      db_time: result.rows[0].time,
+      db_time: dbTime,
       database_url_set: !!process.env.DATABASE_URL,
       github_client_id_set: !!process.env.GITHUB_CLIENT_ID,
       github_client_secret_set: !!process.env.GITHUB_CLIENT_SECRET,

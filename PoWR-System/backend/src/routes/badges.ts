@@ -118,14 +118,11 @@ router.get("/metadata/:tokenId", async (req, res) => {
     }
 
     // Look up badge by token_id
-    const result = await (dbService as any).pool?.query?.(
-      "SELECT * FROM badges WHERE token_id = $1 LIMIT 1",
-      [tokenId]
-    );
+    const badge = await dbService.getBadgeByTokenId(tokenId);
 
-    // Fall back to a generic metadata response if we can't query directly
-    const skillType = result?.rows?.[0]?.skill_type;
-    const tier = result?.rows?.[0]?.tier;
+    // Fall back to a generic metadata response if the badge isn't found
+    const skillType = badge?.skill_type;
+    const tier = badge?.tier;
 
     const skillName = skillType !== undefined ? SKILL_NAMES[skillType] || `Skill ${skillType}` : "PoWR Skill";
     const tierName = tier !== undefined ? TIER_NAMES[tier] || `Tier ${tier}` : "Badge";

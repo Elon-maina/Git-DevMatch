@@ -1,16 +1,8 @@
-import { Pool, neonConfig } from "@neondatabase/serverless";
-import ws from "ws";
+import mysql, { PoolOptions, ResultSetHeader, RowDataPacket } from "mysql2/promise";
+import fs from "fs";
+import path from "path";
 import { Artifact } from "./artifactIngestion";
 import { PoWProfile } from "./scoringEngine";
-
-// Force IPv4 for WebSocket connections — WSL2 has unreachable IPv6 routes
-// which cause Node.js happy-eyeballs to time out before falling back to IPv4
-class IPv4WebSocket extends ws {
-  constructor(url: string, protocols?: string | string[], options?: ws.ClientOptions) {
-    super(url, protocols as string, { ...options, family: 4 } as ws.ClientOptions);
-  }
-}
-neonConfig.webSocketConstructor = IPv4WebSocket;
 
 export interface Badge {
   id: number;
@@ -30,246 +22,77 @@ export interface GithubBadge {
   earnedAt: Date;
 }
 
-// Initialize PostgreSQL connection pool via Neon serverless WebSocket driver
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+// Parse DATABASE_URL (mysql://user:pass@host:3306/dbname) into mysql2 options
+export function mysqlConfigFromUrl(url = process.env.DATABASE_URL): PoolOptions & { database: string } {
+  const u = new URL(url || "mysql://root@localhost:3306/powr");
+  return {
+    host: u.hostname || "localhost",
+    port: u.port ? Number(u.port) : 3306,
+    user: decodeURIComponent(u.username || "root"),
+    password: decodeURIComponent(u.password || ""),
+    database: decodeURIComponent(u.pathname.replace(/^\//, "")) || "powr",
+    // Store and read all timestamps as UTC
+    timezone: "Z",
+    supportBigNumbers: true,
+  };
+}
+
+const dbConfig = mysqlConfigFromUrl();
+
+// Initialize MySQL connection pool
+const pool = mysql.createPool({
+  ...dbConfig,
+  waitForConnections: true,
+  connectionLimit: 10,
 });
 
-// Prevent unhandled pool errors from crashing the process
-pool.on("error", (err: Error) => {
-  console.error("[DB] Pool error:", err.message);
+// Keep NOW()/CURRENT_TIMESTAMP in UTC to match the driver's timezone setting
+pool.pool.on("connection", (conn: any) => {
+  conn.query("SET time_zone = '+00:00'");
 });
 
-// Initialize tables on startup
+async function q<T = any>(sql: string, params: any[] = []): Promise<T[]> {
+  const [rows] = await pool.query<RowDataPacket[]>(sql, params);
+  return rows as unknown as T[];
+}
+
+async function exec(sql: string, params: any[] = []): Promise<ResultSetHeader> {
+  const [result] = await pool.query<ResultSetHeader>(sql, params);
+  return result;
+}
+
+function toDate(value: any): Date | null {
+  if (value === undefined || value === null || value === "") return null;
+  return value instanceof Date ? value : new Date(value);
+}
+
+// Initialize database and tables on startup from database/mysql/schema.sql
 async function initializeTables() {
-  const client = await pool.connect();
+  const schemaPath = path.join(__dirname, "../../database/mysql/schema.sql");
+  const schema = fs
+    .readFileSync(schemaPath, "utf8")
+    .replace(/^CREATE DATABASE[\s\S]*?;\s*$/m, "")
+    .replace(/^USE\s+\w+;\s*$/m, "");
+
+  const { database, ...serverConfig } = dbConfig;
+  const conn = await mysql.createConnection({ ...serverConfig, multipleStatements: true });
   try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        username TEXT PRIMARY KEY,
-        github_id INTEGER,
-        access_token_encrypted TEXT,
-        last_updated TIMESTAMP DEFAULT NOW(),
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS artifacts (
-        id TEXT PRIMARY KEY,
-        username TEXT REFERENCES users(username),
-        type TEXT,
-        data JSONB,
-        timestamp TEXT,
-        repository_owner TEXT,
-        repository_name TEXT,
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS profiles (
-        username TEXT PRIMARY KEY REFERENCES users(username),
-        profile_data JSONB,
-        artifacts_count INTEGER,
-        last_analyzed TIMESTAMP,
-        current_artifact_hash TEXT,
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW()
-      );
-
-      -- Migrations: safe for both fresh and existing databases
-      DO $$ BEGIN
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS github_id INTEGER;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS access_token_encrypted TEXT;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS last_updated TIMESTAMP DEFAULT NOW();
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS stacks_principal TEXT;
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS nostr_pubkey TEXT;
-        ALTER TABLE profiles ADD COLUMN IF NOT EXISTS current_artifact_hash TEXT;
-        -- Drop NOT NULL on legacy password column only if it exists
-        IF EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_name = 'users' AND column_name = 'password'
-        ) THEN
-          ALTER TABLE users ALTER COLUMN password DROP NOT NULL;
-        END IF;
-        -- Alter recruiters only if the table already exists (skip on fresh install)
-        IF EXISTS (
-          SELECT 1 FROM information_schema.tables WHERE table_name = 'recruiters'
-        ) THEN
-          ALTER TABLE recruiters ADD COLUMN IF NOT EXISTS company_size TEXT;
-          ALTER TABLE recruiters ADD COLUMN IF NOT EXISTS last_login TIMESTAMP;
-          ALTER TABLE recruiters ADD COLUMN IF NOT EXISTS nostr_pubkey TEXT;
-          BEGIN
-            ALTER TABLE recruiters ADD COLUMN plan TEXT NOT NULL DEFAULT 'free';
-          EXCEPTION WHEN duplicate_column THEN NULL;
-          END;
-        END IF;
-      END $$;
-
-      CREATE TABLE IF NOT EXISTS blockchain_proofs (
-        id SERIAL PRIMARY KEY,
-        username TEXT REFERENCES users(username),
-        transaction_hash TEXT UNIQUE,
-        artifact_hash TEXT,
-        block_number INTEGER,
-        timestamp BIGINT,
-        skill_scores JSONB,
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS subscriptions (
-        username TEXT PRIMARY KEY REFERENCES users(username),
-        plan_type TEXT NOT NULL DEFAULT 'free',
-        status TEXT NOT NULL DEFAULT 'active',
-        payment_address TEXT,
-        last_payment_tx_hash TEXT,
-        next_update_date TIMESTAMP,
-        webhook_secret TEXT,
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW(),
-        expires_at TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS update_schedule (
-        id SERIAL PRIMARY KEY,
-        username TEXT NOT NULL REFERENCES users(username),
-        scheduled_date TIMESTAMP NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
-        plan_type TEXT NOT NULL,
-        error TEXT,
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS payment_transactions (
-        id SERIAL PRIMARY KEY,
-        username TEXT NOT NULL REFERENCES users(username),
-        tx_hash TEXT UNIQUE NOT NULL,
-        amount TEXT NOT NULL,
-        currency TEXT NOT NULL,
-        plan_type TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
-        block_number INTEGER,
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS badges (
-        id SERIAL PRIMARY KEY,
-        username TEXT REFERENCES users(username),
-        token_id INTEGER,
-        skill_type INTEGER NOT NULL,
-        tier INTEGER NOT NULL,
-        transaction_hash TEXT,
-        stacks_principal TEXT,
-        minted_at TIMESTAMP DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS recruiters (
-        id SERIAL PRIMARY KEY,
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        company_name TEXT NOT NULL,
-        company_size TEXT,
-        plan TEXT NOT NULL DEFAULT 'free',
-        created_at TIMESTAMP DEFAULT NOW(),
-        last_login TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS recruiter_views (
-        id SERIAL PRIMARY KEY,
-        recruiter_id INTEGER REFERENCES recruiters(id),
-        developer_username TEXT NOT NULL,
-        viewed_at TIMESTAMP DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS outreach (
-        id SERIAL PRIMARY KEY,
-        recruiter_id INTEGER REFERENCES recruiters(id),
-        developer_username TEXT NOT NULL,
-        message TEXT,
-        status TEXT NOT NULL DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS saved_pools (
-        id SERIAL PRIMARY KEY,
-        recruiter_id INTEGER REFERENCES recruiters(id),
-        name TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS pool_members (
-        id SERIAL PRIMARY KEY,
-        pool_id INTEGER REFERENCES saved_pools(id) ON DELETE CASCADE,
-        developer_username TEXT NOT NULL,
-        added_at TIMESTAMP DEFAULT NOW(),
-        UNIQUE(pool_id, developer_username)
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_recruiter_views_recruiter ON recruiter_views(recruiter_id);
-      CREATE INDEX IF NOT EXISTS idx_recruiter_views_viewed_at ON recruiter_views(viewed_at);
-      CREATE INDEX IF NOT EXISTS idx_outreach_recruiter ON outreach(recruiter_id);
-      CREATE INDEX IF NOT EXISTS idx_saved_pools_recruiter ON saved_pools(recruiter_id);
-
-      CREATE INDEX IF NOT EXISTS idx_artifacts_username ON artifacts(username);
-      CREATE INDEX IF NOT EXISTS idx_artifacts_timestamp ON artifacts(timestamp);
-      CREATE INDEX IF NOT EXISTS idx_proofs_username ON blockchain_proofs(username);
-      CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions(status);
-      CREATE INDEX IF NOT EXISTS idx_update_schedule_date ON update_schedule(scheduled_date);
-      CREATE INDEX IF NOT EXISTS idx_badges_username ON badges(username);
-
-      CREATE TABLE IF NOT EXISTS github_badges (
-        id SERIAL PRIMARY KEY,
-        username TEXT REFERENCES users(username),
-        badge_key TEXT NOT NULL,
-        earned_at TIMESTAMP DEFAULT NOW(),
-        UNIQUE(username, badge_key)
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_github_badges_username ON github_badges(username);
-
-      CREATE TABLE IF NOT EXISTS jobs (
-        id SERIAL PRIMARY KEY,
-        recruiter_id INTEGER REFERENCES recruiters(id) ON DELETE CASCADE,
-        title TEXT NOT NULL,
-        company TEXT NOT NULL,
-        location TEXT NOT NULL,
-        salary TEXT,
-        type TEXT NOT NULL DEFAULT 'full-time',
-        description TEXT,
-        tags TEXT[],
-        status TEXT NOT NULL DEFAULT 'active',
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-      CREATE INDEX IF NOT EXISTS idx_jobs_recruiter ON jobs(recruiter_id);
-
-      CREATE TABLE IF NOT EXISTS gigs (
-        id SERIAL PRIMARY KEY,
-        recruiter_id INTEGER REFERENCES recruiters(id) ON DELETE CASCADE,
-        title TEXT NOT NULL,
-        client TEXT NOT NULL,
-        location TEXT NOT NULL,
-        rate TEXT,
-        duration TEXT,
-        description TEXT,
-        tags TEXT[],
-        status TEXT NOT NULL DEFAULT 'active',
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_gigs_status ON gigs(status);
-      CREATE INDEX IF NOT EXISTS idx_gigs_recruiter ON gigs(recruiter_id);
-    `);
-    console.log("PostgreSQL tables initialized successfully");
-  } catch (error) {
-    console.error("Failed to initialize PostgreSQL tables:", error);
+    await conn.query(
+      `CREATE DATABASE IF NOT EXISTS \`${database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
+    );
+    await conn.query(`USE \`${database}\``);
+    await conn.query(schema);
+    console.log(`MySQL tables initialized successfully (database: ${database})`);
   } finally {
-    client.release();
+    await conn.end();
   }
 }
 
-// Initialize tables when module loads — retry on failure (e.g. cold Neon start)
+// Initialize tables when module loads — retry on failure (e.g. MySQL still starting)
 function initializeTablesWithRetry(retries = 5, delayMs = 3000) {
   initializeTables().catch((err) => {
-    console.error(`[DB] Table init failed (${retries} retries left):`, err.message);
+    const detail = err.message || err.code || err.errors?.map((e: any) => e.message).join("; ") || String(err);
+    console.error(`[DB] Table init failed (${retries} retries left):`, detail);
     if (retries > 0) {
       setTimeout(() => initializeTablesWithRetry(retries - 1, delayMs), delayMs);
     }
@@ -280,51 +103,45 @@ initializeTablesWithRetry();
 export class DatabaseService {
   // User management
   async upsertUser(username: string, githubId: number, accessToken?: string, stacksPrincipal?: string) {
-    await pool.query(`
+    await exec(`
       INSERT INTO users (username, github_id, access_token_encrypted, stacks_principal, last_updated)
-      VALUES ($1, $2, $3, $4, NOW())
-      ON CONFLICT(username) DO UPDATE SET
-        github_id = COALESCE($2, users.github_id),
-        access_token_encrypted = COALESCE($3, users.access_token_encrypted),
-        stacks_principal = COALESCE($4, users.stacks_principal),
+      VALUES (?, ?, ?, ?, NOW())
+      ON DUPLICATE KEY UPDATE
+        github_id = COALESCE(VALUES(github_id), github_id),
+        access_token_encrypted = COALESCE(VALUES(access_token_encrypted), access_token_encrypted),
+        stacks_principal = COALESCE(VALUES(stacks_principal), stacks_principal),
         last_updated = NOW()
-    `, [username, githubId, accessToken, stacksPrincipal || null]);
+    `, [username, githubId ?? null, accessToken ?? null, stacksPrincipal || null]);
   }
 
   async getUser(username: string) {
-    const result = await pool.query(
-      "SELECT * FROM users WHERE username = $1",
-      [username]
-    );
-    return result.rows[0] || null;
+    const rows = await q("SELECT * FROM users WHERE username = ?", [username]);
+    return rows[0] || null;
   }
 
   async updateStacksPrincipal(username: string, principal: string): Promise<void> {
-    await pool.query(
-      "UPDATE users SET stacks_principal = $2, last_updated = NOW() WHERE username = $1",
-      [username, principal]
+    await exec(
+      "UPDATE users SET stacks_principal = ?, last_updated = NOW() WHERE username = ?",
+      [principal, username]
     );
   }
 
   async getUserStacksPrincipal(username: string): Promise<string | null> {
-    const result = await pool.query(
-      "SELECT stacks_principal FROM users WHERE username = $1",
-      [username]
-    );
-    return result.rows[0]?.stacks_principal || null;
+    const rows = await q("SELECT stacks_principal FROM users WHERE username = ?", [username]);
+    return rows[0]?.stacks_principal || null;
   }
 
   // Artifact management
   async saveArtifacts(username: string, artifacts: Artifact[]) {
-    const client = await pool.connect();
+    const conn = await pool.getConnection();
     try {
-      await client.query("BEGIN");
-      await client.query("DELETE FROM artifacts WHERE username = $1", [username]);
+      await conn.beginTransaction();
+      await conn.query("DELETE FROM artifacts WHERE username = ?", [username]);
 
       for (const artifact of artifacts) {
-        await client.query(`
+        await conn.query(`
           INSERT INTO artifacts (id, username, type, data, timestamp, repository_owner, repository_name)
-          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
         `, [
           artifact.id,
           username,
@@ -335,27 +152,27 @@ export class DatabaseService {
           artifact.repository?.name || null,
         ]);
       }
-      await client.query("COMMIT");
+      await conn.commit();
     } catch (error) {
-      await client.query("ROLLBACK");
+      await conn.rollback();
       throw error;
     } finally {
-      client.release();
+      conn.release();
     }
   }
 
   async getArtifacts(username: string, since?: Date): Promise<Artifact[]> {
-    let query = "SELECT * FROM artifacts WHERE username = $1";
+    let query = "SELECT * FROM artifacts WHERE username = ?";
     const params: any[] = [username];
 
     if (since) {
-      query += " AND timestamp >= $2";
+      query += " AND timestamp >= ?";
       params.push(since.toISOString());
     }
     query += " ORDER BY timestamp DESC";
 
-    const result = await pool.query(query, params);
-    return result.rows.map((row) => ({
+    const rows = await q(query, params);
+    return rows.map((row) => ({
       type: row.type as "repo" | "commit" | "pull_request",
       id: row.id,
       data: row.data,
@@ -369,23 +186,23 @@ export class DatabaseService {
   // Profile management
   async saveProfile(username: string, profile: PoWProfile, artifactsCount: number, artifactHash?: string) {
     if (artifactHash) {
-      await pool.query(`
+      await exec(`
         INSERT INTO profiles (username, profile_data, artifacts_count, current_artifact_hash, last_analyzed, updated_at)
-        VALUES ($1, $2, $3, $4, NOW(), NOW())
-        ON CONFLICT(username) DO UPDATE SET
-          profile_data = $2,
-          artifacts_count = $3,
-          current_artifact_hash = $4,
+        VALUES (?, ?, ?, ?, NOW(), NOW())
+        ON DUPLICATE KEY UPDATE
+          profile_data = VALUES(profile_data),
+          artifacts_count = VALUES(artifacts_count),
+          current_artifact_hash = VALUES(current_artifact_hash),
           last_analyzed = NOW(),
           updated_at = NOW()
       `, [username, JSON.stringify(profile), artifactsCount, artifactHash]);
     } else {
-      await pool.query(`
+      await exec(`
         INSERT INTO profiles (username, profile_data, artifacts_count, last_analyzed, updated_at)
-        VALUES ($1, $2, $3, NOW(), NOW())
-        ON CONFLICT(username) DO UPDATE SET
-          profile_data = $2,
-          artifacts_count = $3,
+        VALUES (?, ?, ?, NOW(), NOW())
+        ON DUPLICATE KEY UPDATE
+          profile_data = VALUES(profile_data),
+          artifacts_count = VALUES(artifacts_count),
           last_analyzed = NOW(),
           updated_at = NOW()
       `, [username, JSON.stringify(profile), artifactsCount]);
@@ -393,12 +210,9 @@ export class DatabaseService {
   }
 
   async getProfile(username: string): Promise<PoWProfile | null> {
-    const result = await pool.query(
-      "SELECT * FROM profiles WHERE username = $1",
-      [username]
-    );
-    if (!result.rows[0]) return null;
-    return result.rows[0].profile_data;
+    const rows = await q("SELECT * FROM profiles WHERE username = ?", [username]);
+    if (!rows[0]) return null;
+    return rows[0].profile_data;
   }
 
   async getProfileWithMeta(username: string): Promise<{
@@ -407,26 +221,23 @@ export class DatabaseService {
     artifactsCount: number;
     currentArtifactHash: string | null;
   } | null> {
-    const result = await pool.query(
-      "SELECT profile_data, last_analyzed, artifacts_count, current_artifact_hash FROM profiles WHERE username = $1",
+    const rows = await q(
+      "SELECT profile_data, last_analyzed, artifacts_count, current_artifact_hash FROM profiles WHERE username = ?",
       [username]
     );
-    if (!result.rows[0]) return null;
+    if (!rows[0]) return null;
     return {
-      profile: result.rows[0].profile_data,
-      lastAnalyzed: result.rows[0].last_analyzed ? new Date(result.rows[0].last_analyzed) : null,
-      artifactsCount: result.rows[0].artifacts_count || 0,
-      currentArtifactHash: result.rows[0].current_artifact_hash || null
+      profile: rows[0].profile_data,
+      lastAnalyzed: rows[0].last_analyzed ? new Date(rows[0].last_analyzed) : null,
+      artifactsCount: rows[0].artifacts_count || 0,
+      currentArtifactHash: rows[0].current_artifact_hash || null
     };
   }
 
   async shouldRefreshProfile(username: string, maxAgeHours: number = 24): Promise<boolean> {
-    const result = await pool.query(
-      "SELECT last_analyzed FROM profiles WHERE username = $1",
-      [username]
-    );
-    if (!result.rows[0]?.last_analyzed) return true;
-    const lastAnalyzed = new Date(result.rows[0].last_analyzed);
+    const rows = await q("SELECT last_analyzed FROM profiles WHERE username = ?", [username]);
+    if (!rows[0]?.last_analyzed) return true;
+    const lastAnalyzed = new Date(rows[0].last_analyzed);
     const hoursSince = (Date.now() - lastAnalyzed.getTime()) / (1000 * 60 * 60);
     return hoursSince >= maxAgeHours;
   }
@@ -440,36 +251,14 @@ export class DatabaseService {
     timestamp: number,
     skillScores: number[]
   ) {
-    await pool.query(`
+    await exec(`
       INSERT INTO blockchain_proofs (username, transaction_hash, artifact_hash, block_number, timestamp, skill_scores)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      ON CONFLICT(transaction_hash) DO NOTHING
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE id = id
     `, [username, transactionHash, artifactHash, blockNumber, timestamp, JSON.stringify(skillScores)]);
   }
 
-  async getBlockchainProofs(username: string): Promise<any[]> {
-    const result = await pool.query(
-      "SELECT * FROM blockchain_proofs WHERE username = $1 ORDER BY timestamp DESC",
-      [username]
-    );
-    return result.rows.map((row) => ({
-      id: row.id,
-      transactionHash: row.transaction_hash,
-      artifactHash: row.artifact_hash,
-      blockNumber: row.block_number,
-      timestamp: row.timestamp,
-      skillScores: row.skill_scores,
-      createdAt: row.created_at,
-    }));
-  }
-
-  async getLatestBlockchainProof(username: string): Promise<any | null> {
-    const result = await pool.query(
-      "SELECT * FROM blockchain_proofs WHERE username = $1 ORDER BY timestamp DESC LIMIT 1",
-      [username]
-    );
-    const row = result.rows[0];
-    if (!row) return null;
+  private mapProof(row: any) {
     return {
       id: row.id,
       transactionHash: row.transaction_hash,
@@ -481,17 +270,33 @@ export class DatabaseService {
     };
   }
 
+  async getBlockchainProofs(username: string): Promise<any[]> {
+    const rows = await q(
+      "SELECT * FROM blockchain_proofs WHERE username = ? ORDER BY timestamp DESC",
+      [username]
+    );
+    return rows.map((row) => this.mapProof(row));
+  }
+
+  async getLatestBlockchainProof(username: string): Promise<any | null> {
+    const rows = await q(
+      "SELECT * FROM blockchain_proofs WHERE username = ? ORDER BY timestamp DESC LIMIT 1",
+      [username]
+    );
+    return rows[0] ? this.mapProof(rows[0]) : null;
+  }
+
   // Subscription management
   async saveSubscription(username: string, subscription: any) {
-    await pool.query(`
+    await exec(`
       INSERT INTO subscriptions (username, plan_type, status, payment_address, last_payment_tx_hash, next_update_date, updated_at)
-      VALUES ($1, $2, $3, $4, $5, $6, NOW())
-      ON CONFLICT(username) DO UPDATE SET
-        plan_type = COALESCE($2, subscriptions.plan_type),
-        status = COALESCE($3, subscriptions.status),
-        payment_address = COALESCE($4, subscriptions.payment_address),
-        last_payment_tx_hash = COALESCE($5, subscriptions.last_payment_tx_hash),
-        next_update_date = COALESCE($6, subscriptions.next_update_date),
+      VALUES (?, ?, ?, ?, ?, ?, NOW())
+      ON DUPLICATE KEY UPDATE
+        plan_type = COALESCE(VALUES(plan_type), plan_type),
+        status = COALESCE(VALUES(status), status),
+        payment_address = COALESCE(VALUES(payment_address), payment_address),
+        last_payment_tx_hash = COALESCE(VALUES(last_payment_tx_hash), last_payment_tx_hash),
+        next_update_date = COALESCE(VALUES(next_update_date), next_update_date),
         updated_at = NOW()
     `, [
       username,
@@ -499,7 +304,7 @@ export class DatabaseService {
       subscription.status || "active",
       subscription.payment_address || null,
       subscription.last_payment_tx_hash || null,
-      subscription.next_update_date || null,
+      toDate(subscription.next_update_date),
     ]);
   }
 
@@ -514,48 +319,44 @@ export class DatabaseService {
 
   async updateSubscription(username: string, updates: any) {
     const fields: string[] = [];
-    const values: any[] = [username];
-    let paramIndex = 2;
+    const values: any[] = [];
 
     if (updates.plan_type !== undefined) {
-      fields.push(`plan_type = $${paramIndex++}`);
+      fields.push("plan_type = ?");
       values.push(updates.plan_type);
     }
     if (updates.status !== undefined) {
-      fields.push(`status = $${paramIndex++}`);
+      fields.push("status = ?");
       values.push(updates.status);
     }
     if (updates.nextUpdateDate !== undefined) {
-      fields.push(`next_update_date = $${paramIndex++}`);
-      values.push(updates.nextUpdateDate);
+      fields.push("next_update_date = ?");
+      values.push(toDate(updates.nextUpdateDate));
     }
     if (updates.payment_address !== undefined) {
-      fields.push(`payment_address = $${paramIndex++}`);
+      fields.push("payment_address = ?");
       values.push(updates.payment_address);
     }
     fields.push("updated_at = NOW()");
 
     if (fields.length > 1) {
-      await pool.query(
-        `UPDATE subscriptions SET ${fields.join(", ")} WHERE username = $1`,
-        values
+      await exec(
+        `UPDATE subscriptions SET ${fields.join(", ")} WHERE username = ?`,
+        [...values, username]
       );
     }
   }
 
   async cancelSubscription(username: string) {
-    await pool.query(
-      "UPDATE subscriptions SET status = 'cancelled', updated_at = NOW() WHERE username = $1",
+    await exec(
+      "UPDATE subscriptions SET status = 'cancelled', updated_at = NOW() WHERE username = ?",
       [username]
     );
   }
 
   async getSubscription(username: string): Promise<any | null> {
-    const result = await pool.query(
-      "SELECT * FROM subscriptions WHERE username = $1",
-      [username]
-    );
-    const row = result.rows[0];
+    const rows = await q("SELECT * FROM subscriptions WHERE username = ?", [username]);
+    const row = rows[0];
     if (!row) return null;
     return {
       username: row.username,
@@ -570,18 +371,18 @@ export class DatabaseService {
   }
 
   async updateSubscriptionNextUpdate(username: string, nextUpdateDate: Date) {
-    await pool.query(
-      "UPDATE subscriptions SET next_update_date = $2, updated_at = NOW() WHERE username = $1",
-      [username, nextUpdateDate]
+    await exec(
+      "UPDATE subscriptions SET next_update_date = ?, updated_at = NOW() WHERE username = ?",
+      [toDate(nextUpdateDate), username]
     );
   }
 
   // Scheduled updates
   async scheduleUpdate(username: string, scheduledDate: Date, planType: string) {
-    await pool.query(`
+    await exec(`
       INSERT INTO update_schedule (username, scheduled_date, status, plan_type)
-      VALUES ($1, $2, 'pending', $3)
-    `, [username, scheduledDate, planType]);
+      VALUES (?, ?, 'pending', ?)
+    `, [username, toDate(scheduledDate), planType]);
   }
 
   async getScheduledUpdates(beforeDate?: Date): Promise<any[]> {
@@ -589,13 +390,13 @@ export class DatabaseService {
     const params: any[] = [];
 
     if (beforeDate) {
-      query += " AND scheduled_date <= $1";
-      params.push(beforeDate);
+      query += " AND scheduled_date <= ?";
+      params.push(toDate(beforeDate));
     }
     query += " ORDER BY scheduled_date ASC";
 
-    const result = await pool.query(query, params);
-    return result.rows.map((row) => ({
+    const rows = await q(query, params);
+    return rows.map((row) => ({
       id: row.id,
       username: row.username,
       scheduledDate: row.scheduled_date,
@@ -609,10 +410,7 @@ export class DatabaseService {
   }
 
   async markUpdateComplete(id: number) {
-    await pool.query(
-      "UPDATE update_schedule SET status = 'completed' WHERE id = $1",
-      [id]
-    );
+    await exec("UPDATE update_schedule SET status = 'completed' WHERE id = ?", [id]);
   }
 
   async markScheduledUpdateComplete(id: number) {
@@ -620,10 +418,7 @@ export class DatabaseService {
   }
 
   async markUpdateFailed(id: number, error: string) {
-    await pool.query(
-      "UPDATE update_schedule SET status = 'failed', error = $2 WHERE id = $1",
-      [id, error]
-    );
+    await exec("UPDATE update_schedule SET status = 'failed', error = ? WHERE id = ?", [error, id]);
   }
 
   async markScheduledUpdateFailed(id: number, error?: string) {
@@ -639,25 +434,22 @@ export class DatabaseService {
     planType: string,
     blockNumber?: number
   ) {
-    await pool.query(`
+    await exec(`
       INSERT INTO payment_transactions (username, tx_hash, amount, currency, plan_type, block_number, status)
-      VALUES ($1, $2, $3, $4, $5, $6, 'pending')
-      ON CONFLICT(tx_hash) DO NOTHING
+      VALUES (?, ?, ?, ?, ?, ?, 'pending')
+      ON DUPLICATE KEY UPDATE id = id
     `, [username, txHash, amount, currency, planType, blockNumber || null]);
   }
 
   async getPaymentTransaction(txHash: string): Promise<any | null> {
-    const result = await pool.query(
-      "SELECT * FROM payment_transactions WHERE tx_hash = $1",
-      [txHash]
-    );
-    return result.rows[0] || null;
+    const rows = await q("SELECT * FROM payment_transactions WHERE tx_hash = ?", [txHash]);
+    return rows[0] || null;
   }
 
   async updatePaymentStatus(txHash: string, status: string, blockNumber?: number) {
-    await pool.query(
-      "UPDATE payment_transactions SET status = $2, block_number = COALESCE($3, block_number) WHERE tx_hash = $1",
-      [txHash, status, blockNumber]
+    await exec(
+      "UPDATE payment_transactions SET status = ?, block_number = COALESCE(?, block_number) WHERE tx_hash = ?",
+      [status, blockNumber ?? null, txHash]
     );
   }
 
@@ -674,18 +466,15 @@ export class DatabaseService {
     txHash: string | null,
     stacksPrincipal: string | null
   ): Promise<void> {
-    await pool.query(`
+    await exec(`
       INSERT INTO badges (username, token_id, skill_type, tier, transaction_hash, stacks_principal)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      VALUES (?, ?, ?, ?, ?, ?)
     `, [username, tokenId, skillType, tier, txHash, stacksPrincipal]);
   }
 
   async getUserBadges(username: string): Promise<Badge[]> {
-    const result = await pool.query(
-      "SELECT * FROM badges WHERE username = $1 ORDER BY minted_at DESC",
-      [username]
-    );
-    return result.rows.map((row) => ({
+    const rows = await q("SELECT * FROM badges WHERE username = ? ORDER BY minted_at DESC", [username]);
+    return rows.map((row) => ({
       id: row.id,
       username: row.username,
       tokenId: row.token_id,
@@ -697,21 +486,23 @@ export class DatabaseService {
     }));
   }
 
+  async getBadgeByTokenId(tokenId: number): Promise<any | null> {
+    const rows = await q("SELECT * FROM badges WHERE token_id = ? LIMIT 1", [tokenId]);
+    return rows[0] || null;
+  }
+
   async saveGithubBadge(username: string, badgeKey: string): Promise<void> {
-    await pool.query(
+    await exec(
       `INSERT INTO github_badges (username, badge_key)
-       VALUES ($1, $2)
-       ON CONFLICT (username, badge_key) DO NOTHING`,
+       VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE id = id`,
       [username, badgeKey]
     );
   }
 
   async getGithubBadges(username: string): Promise<GithubBadge[]> {
-    const result = await pool.query(
-      "SELECT * FROM github_badges WHERE username = $1 ORDER BY earned_at DESC",
-      [username]
-    );
-    return result.rows.map((row) => ({
+    const rows = await q("SELECT * FROM github_badges WHERE username = ? ORDER BY earned_at DESC", [username]);
+    return rows.map((row) => ({
       id: row.id,
       username: row.username,
       badgeKey: row.badge_key,
@@ -721,123 +512,114 @@ export class DatabaseService {
 
   // Recruiter management
   async getRecruiterByEmail(email: string): Promise<any | null> {
-    const result = await pool.query(
-      "SELECT * FROM recruiters WHERE email = $1",
-      [email]
-    );
-    return result.rows[0] || null;
+    const rows = await q("SELECT * FROM recruiters WHERE email = ?", [email]);
+    return rows[0] || null;
   }
 
   async getRecruiterById(id: number): Promise<any | null> {
-    const result = await pool.query(
-      "SELECT id, email, company_name, company_size, plan, created_at, last_login FROM recruiters WHERE id = $1",
+    const rows = await q(
+      "SELECT id, email, company_name, company_size, plan, created_at, last_login FROM recruiters WHERE id = ?",
       [id]
     );
-    return result.rows[0] || null;
+    return rows[0] || null;
   }
 
   async createRecruiter(email: string, passwordHash: string, companyName: string, companySize?: string): Promise<any> {
-    const result = await pool.query(`
+    const result = await exec(`
       INSERT INTO recruiters (email, password_hash, company_name, company_size)
-      VALUES ($1, $2, $3, $4)
-      RETURNING id, email, company_name, company_size, plan, created_at
+      VALUES (?, ?, ?, ?)
     `, [email, passwordHash, companyName, companySize || null]);
-    return result.rows[0];
+    const rows = await q(
+      "SELECT id, email, company_name, company_size, plan, created_at FROM recruiters WHERE id = ?",
+      [result.insertId]
+    );
+    return rows[0];
   }
 
   async updateRecruiterLastLogin(id: number): Promise<void> {
-    await pool.query(
-      "UPDATE recruiters SET last_login = NOW() WHERE id = $1",
-      [id]
-    );
+    await exec("UPDATE recruiters SET last_login = NOW() WHERE id = ?", [id]);
   }
 
   async updateRecruiterPlan(id: number, plan: string): Promise<void> {
-    await pool.query(
-      "UPDATE recruiters SET plan = $2 WHERE id = $1",
-      [id, plan]
-    );
+    await exec("UPDATE recruiters SET plan = ? WHERE id = ?", [plan, id]);
   }
 
   async getRecruiterViewCount(recruiterId: number, since: Date): Promise<number> {
-    const result = await pool.query(
-      "SELECT COUNT(DISTINCT developer_username) FROM recruiter_views WHERE recruiter_id = $1 AND viewed_at >= $2",
-      [recruiterId, since]
+    const rows = await q(
+      "SELECT COUNT(DISTINCT developer_username) AS count FROM recruiter_views WHERE recruiter_id = ? AND viewed_at >= ?",
+      [recruiterId, toDate(since)]
     );
-    return parseInt(result.rows[0].count, 10);
+    return Number(rows[0].count);
   }
 
   async logRecruiterView(recruiterId: number, developerUsername: string): Promise<void> {
-    await pool.query(
-      "INSERT INTO recruiter_views (recruiter_id, developer_username) VALUES ($1, $2)",
+    await exec(
+      "INSERT INTO recruiter_views (recruiter_id, developer_username) VALUES (?, ?)",
       [recruiterId, developerUsername]
     );
   }
 
   async getSavedPools(recruiterId: number): Promise<any[]> {
-    const result = await pool.query(`
+    return q(`
       SELECT sp.*, COUNT(pm.id) AS member_count
       FROM saved_pools sp
       LEFT JOIN pool_members pm ON pm.pool_id = sp.id
-      WHERE sp.recruiter_id = $1
+      WHERE sp.recruiter_id = ?
       GROUP BY sp.id
       ORDER BY sp.created_at DESC
     `, [recruiterId]);
-    return result.rows;
   }
 
   async createSavedPool(recruiterId: number, name: string): Promise<any> {
-    const result = await pool.query(
-      "INSERT INTO saved_pools (recruiter_id, name) VALUES ($1, $2) RETURNING *",
+    const result = await exec(
+      "INSERT INTO saved_pools (recruiter_id, name) VALUES (?, ?)",
       [recruiterId, name]
     );
-    return result.rows[0];
+    const rows = await q("SELECT * FROM saved_pools WHERE id = ?", [result.insertId]);
+    return rows[0];
   }
 
   async getPoolMembers(poolId: number): Promise<string[]> {
-    const result = await pool.query(
-      "SELECT developer_username FROM pool_members WHERE pool_id = $1 ORDER BY added_at DESC",
+    const rows = await q(
+      "SELECT developer_username FROM pool_members WHERE pool_id = ? ORDER BY added_at DESC",
       [poolId]
     );
-    return result.rows.map((r: any) => r.developer_username);
+    return rows.map((r: any) => r.developer_username);
   }
 
   async addToPool(poolId: number, username: string): Promise<void> {
-    await pool.query(
-      "INSERT INTO pool_members (pool_id, developer_username) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    await exec(
+      "INSERT INTO pool_members (pool_id, developer_username) VALUES (?, ?) ON DUPLICATE KEY UPDATE id = id",
       [poolId, username]
     );
   }
 
   async removeFromPool(poolId: number, username: string): Promise<void> {
-    await pool.query(
-      "DELETE FROM pool_members WHERE pool_id = $1 AND developer_username = $2",
+    await exec(
+      "DELETE FROM pool_members WHERE pool_id = ? AND developer_username = ?",
       [poolId, username]
     );
   }
 
   async deleteSavedPool(poolId: number, recruiterId: number): Promise<void> {
-    await pool.query(
-      "DELETE FROM saved_pools WHERE id = $1 AND recruiter_id = $2",
-      [poolId, recruiterId]
-    );
+    await exec("DELETE FROM saved_pools WHERE id = ? AND recruiter_id = ?", [poolId, recruiterId]);
   }
 
   async createOutreach(recruiterId: number, developerUsername: string, message: string): Promise<any> {
-    const result = await pool.query(`
+    const result = await exec(`
       INSERT INTO outreach (recruiter_id, developer_username, message)
-      VALUES ($1, $2, $3)
-      RETURNING *
+      VALUES (?, ?, ?)
     `, [recruiterId, developerUsername, message]);
-    return result.rows[0];
+    const rows = await q("SELECT * FROM outreach WHERE id = ?", [result.insertId]);
+    return rows[0];
   }
 
   async getOutreachCount(recruiterId: number, since: Date): Promise<number> {
-    const result = await pool.query(
-      "SELECT COUNT(*) FROM outreach WHERE recruiter_id = $1 AND created_at >= $2",
-      [recruiterId, since]
+    const rows = await q(
+      "SELECT COUNT(*) AS count FROM outreach WHERE recruiter_id = ? AND created_at >= ?",
+      [recruiterId, toDate(since)]
     );
-    return parseInt(result.rows[0].count, 10);
+    return Number(rows[0].count);
   }
 
   // Talent search for recruiters
@@ -854,7 +636,6 @@ export class DatabaseService {
     const offset = (page - 1) * limit;
     const conditions: string[] = [];
     const values: any[] = [];
-    let idx = 1;
 
     // Base: must have a profile
     let query = `
@@ -871,28 +652,29 @@ export class DatabaseService {
     `;
 
     if (activeWithinDays) {
-      conditions.push(`p.last_analyzed >= NOW() - INTERVAL '${activeWithinDays} days'`);
+      conditions.push("p.last_analyzed >= NOW() - INTERVAL ? DAY");
+      values.push(Number(activeWithinDays));
     }
 
     if (hasOnChainProof === true) {
-      conditions.push(`EXISTS(SELECT 1 FROM blockchain_proofs bp WHERE bp.username = u.username)`);
+      conditions.push("EXISTS(SELECT 1 FROM blockchain_proofs bp WHERE bp.username = u.username)");
     }
 
     if (conditions.length > 0) {
       query += " WHERE " + conditions.join(" AND ");
     }
 
-    query += ` ORDER BY p.last_analyzed DESC NULLS LAST`;
+    const countQuery = `SELECT COUNT(*) AS count FROM (${query}) sub`;
+    query += " ORDER BY p.last_analyzed IS NULL, p.last_analyzed DESC";
 
-    const countQuery = `SELECT COUNT(*) FROM (${query}) sub`;
-    const [dataResult, countResult] = await Promise.all([
-      pool.query(query + ` LIMIT $${idx} OFFSET $${idx + 1}`, [...values, limit, offset]),
-      pool.query(countQuery, values),
+    const [dataRows, countRows] = await Promise.all([
+      q(query + " LIMIT ? OFFSET ?", [...values, limit, offset]),
+      q(countQuery, values),
     ]);
 
-    const total = parseInt(countResult.rows[0].count, 10);
+    const total = Number(countRows[0].count);
 
-    const developers = dataResult.rows
+    const developers = dataRows
       .map((row: any) => {
         const profile = row.profile_data;
         if (!profile) return null;
@@ -917,7 +699,7 @@ export class DatabaseService {
           topSkills,
           overallIndex: profile.overallIndex || 0,
           lastActive: row.last_analyzed,
-          hasOnChainProof: row.has_on_chain_proof,
+          hasOnChainProof: Boolean(row.has_on_chain_proof),
           proofCount: 0,
           artifactSummary: profile.artifactSummary || {},
         };
@@ -929,131 +711,131 @@ export class DatabaseService {
 
   // Cleanup
   async cleanupOldArtifacts(olderThanDays: number) {
-    await pool.query(
-      "DELETE FROM artifacts WHERE created_at < NOW() - INTERVAL '$1 days'",
-      [olderThanDays]
-    );
+    await exec("DELETE FROM artifacts WHERE created_at < NOW() - INTERVAL ? DAY", [olderThanDays]);
   }
 
   async cleanupOldProofs(olderThanDays: number) {
-    await pool.query(
-      "DELETE FROM blockchain_proofs WHERE created_at < NOW() - INTERVAL '$1 days'",
-      [olderThanDays]
-    );
+    await exec("DELETE FROM blockchain_proofs WHERE created_at < NOW() - INTERVAL ? DAY", [olderThanDays]);
   }
 
   // ── Jobs CRUD ──────────────────────────────────────────────────────────────
   async createJob(recruiterId: number, data: { title: string; company: string; location: string; salary?: string; type?: string; description?: string; tags?: string[] }): Promise<any> {
-    const result = await pool.query(`
+    const result = await exec(`
       INSERT INTO jobs (recruiter_id, title, company, location, salary, type, description, tags)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING *
-    `, [recruiterId, data.title, data.company, data.location, data.salary || null, data.type || 'full-time', data.description || null, data.tags || []]);
-    return result.rows[0];
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `, [recruiterId, data.title, data.company, data.location, data.salary || null, data.type || 'full-time', data.description || null, JSON.stringify(data.tags || [])]);
+    const rows = await q("SELECT * FROM jobs WHERE id = ?", [result.insertId]);
+    return rows[0];
   }
 
   async getJobs(params?: { status?: string; limit?: number; offset?: number }): Promise<{ jobs: any[]; total: number }> {
     const { status = 'active', limit = 20, offset = 0 } = params || {};
-    const [dataResult, countResult] = await Promise.all([
-      pool.query('SELECT j.*, r.company_name AS recruiter_company FROM jobs j LEFT JOIN recruiters r ON r.id = j.recruiter_id WHERE j.status = $1 ORDER BY j.created_at DESC LIMIT $2 OFFSET $3', [status, limit, offset]),
-      pool.query('SELECT COUNT(*) FROM jobs WHERE status = $1', [status]),
+    const [jobs, countRows] = await Promise.all([
+      q('SELECT j.*, r.company_name AS recruiter_company FROM jobs j LEFT JOIN recruiters r ON r.id = j.recruiter_id WHERE j.status = ? ORDER BY j.created_at DESC LIMIT ? OFFSET ?', [status, limit, offset]),
+      q('SELECT COUNT(*) AS count FROM jobs WHERE status = ?', [status]),
     ]);
-    return { jobs: dataResult.rows, total: parseInt(countResult.rows[0].count, 10) };
+    return { jobs, total: Number(countRows[0].count) };
   }
 
   async getJobsByRecruiter(recruiterId: number): Promise<any[]> {
-    const result = await pool.query('SELECT * FROM jobs WHERE recruiter_id = $1 ORDER BY created_at DESC', [recruiterId]);
-    return result.rows;
+    return q('SELECT * FROM jobs WHERE recruiter_id = ? ORDER BY created_at DESC', [recruiterId]);
   }
 
   async getJobById(id: number): Promise<any | null> {
-    const result = await pool.query('SELECT j.*, r.company_name AS recruiter_company FROM jobs j LEFT JOIN recruiters r ON r.id = j.recruiter_id WHERE j.id = $1', [id]);
-    return result.rows[0] || null;
+    const rows = await q('SELECT j.*, r.company_name AS recruiter_company FROM jobs j LEFT JOIN recruiters r ON r.id = j.recruiter_id WHERE j.id = ?', [id]);
+    return rows[0] || null;
   }
 
   async updateJob(id: number, recruiterId: number, data: Partial<{ title: string; company: string; location: string; salary: string; type: string; description: string; tags: string[]; status: string }>): Promise<any> {
     const fields: string[] = [];
-    const values: any[] = [id, recruiterId];
-    let idx = 3;
-    if (data.title !== undefined) { fields.push(`title = $${idx++}`); values.push(data.title); }
-    if (data.company !== undefined) { fields.push(`company = $${idx++}`); values.push(data.company); }
-    if (data.location !== undefined) { fields.push(`location = $${idx++}`); values.push(data.location); }
-    if (data.salary !== undefined) { fields.push(`salary = $${idx++}`); values.push(data.salary); }
-    if (data.type !== undefined) { fields.push(`type = $${idx++}`); values.push(data.type); }
-    if (data.description !== undefined) { fields.push(`description = $${idx++}`); values.push(data.description); }
-    if (data.tags !== undefined) { fields.push(`tags = $${idx++}`); values.push(data.tags); }
-    if (data.status !== undefined) { fields.push(`status = $${idx++}`); values.push(data.status); }
+    const values: any[] = [];
+    if (data.title !== undefined) { fields.push('title = ?'); values.push(data.title); }
+    if (data.company !== undefined) { fields.push('company = ?'); values.push(data.company); }
+    if (data.location !== undefined) { fields.push('location = ?'); values.push(data.location); }
+    if (data.salary !== undefined) { fields.push('salary = ?'); values.push(data.salary); }
+    if (data.type !== undefined) { fields.push('type = ?'); values.push(data.type); }
+    if (data.description !== undefined) { fields.push('description = ?'); values.push(data.description); }
+    if (data.tags !== undefined) { fields.push('tags = ?'); values.push(JSON.stringify(data.tags)); }
+    if (data.status !== undefined) { fields.push('status = ?'); values.push(data.status); }
     fields.push('updated_at = NOW()');
-    const result = await pool.query(`UPDATE jobs SET ${fields.join(', ')} WHERE id = $1 AND recruiter_id = $2 RETURNING *`, values);
-    return result.rows[0] || null;
+    const result = await exec(`UPDATE jobs SET ${fields.join(', ')} WHERE id = ? AND recruiter_id = ?`, [...values, id, recruiterId]);
+    if (result.affectedRows === 0) return null;
+    const rows = await q('SELECT * FROM jobs WHERE id = ?', [id]);
+    return rows[0] || null;
   }
 
   async deleteJob(id: number, recruiterId: number): Promise<void> {
-    await pool.query('DELETE FROM jobs WHERE id = $1 AND recruiter_id = $2', [id, recruiterId]);
+    await exec('DELETE FROM jobs WHERE id = ? AND recruiter_id = ?', [id, recruiterId]);
   }
 
   // ── Gigs CRUD ──────────────────────────────────────────────────────────────
   async createGig(recruiterId: number, data: { title: string; client: string; location: string; rate?: string; duration?: string; description?: string; tags?: string[] }): Promise<any> {
-    const result = await pool.query(`
+    const result = await exec(`
       INSERT INTO gigs (recruiter_id, title, client, location, rate, duration, description, tags)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING *
-    `, [recruiterId, data.title, data.client, data.location, data.rate || null, data.duration || null, data.description || null, data.tags || []]);
-    return result.rows[0];
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `, [recruiterId, data.title, data.client, data.location, data.rate || null, data.duration || null, data.description || null, JSON.stringify(data.tags || [])]);
+    const rows = await q("SELECT * FROM gigs WHERE id = ?", [result.insertId]);
+    return rows[0];
   }
 
   async getGigs(params?: { status?: string; limit?: number; offset?: number }): Promise<{ gigs: any[]; total: number }> {
     const { status = 'active', limit = 20, offset = 0 } = params || {};
-    const [dataResult, countResult] = await Promise.all([
-      pool.query('SELECT g.*, r.company_name AS recruiter_company FROM gigs g LEFT JOIN recruiters r ON r.id = g.recruiter_id WHERE g.status = $1 ORDER BY g.created_at DESC LIMIT $2 OFFSET $3', [status, limit, offset]),
-      pool.query('SELECT COUNT(*) FROM gigs WHERE status = $1', [status]),
+    const [gigs, countRows] = await Promise.all([
+      q('SELECT g.*, r.company_name AS recruiter_company FROM gigs g LEFT JOIN recruiters r ON r.id = g.recruiter_id WHERE g.status = ? ORDER BY g.created_at DESC LIMIT ? OFFSET ?', [status, limit, offset]),
+      q('SELECT COUNT(*) AS count FROM gigs WHERE status = ?', [status]),
     ]);
-    return { gigs: dataResult.rows, total: parseInt(countResult.rows[0].count, 10) };
+    return { gigs, total: Number(countRows[0].count) };
   }
 
   async getGigsByRecruiter(recruiterId: number): Promise<any[]> {
-    const result = await pool.query('SELECT * FROM gigs WHERE recruiter_id = $1 ORDER BY created_at DESC', [recruiterId]);
-    return result.rows;
+    return q('SELECT * FROM gigs WHERE recruiter_id = ? ORDER BY created_at DESC', [recruiterId]);
   }
 
   async getGigById(id: number): Promise<any | null> {
-    const result = await pool.query('SELECT g.*, r.company_name AS recruiter_company FROM gigs g LEFT JOIN recruiters r ON r.id = g.recruiter_id WHERE g.id = $1', [id]);
-    return result.rows[0] || null;
+    const rows = await q('SELECT g.*, r.company_name AS recruiter_company FROM gigs g LEFT JOIN recruiters r ON r.id = g.recruiter_id WHERE g.id = ?', [id]);
+    return rows[0] || null;
   }
 
   async updateGig(id: number, recruiterId: number, data: Partial<{ title: string; client: string; location: string; rate: string; duration: string; description: string; tags: string[]; status: string }>): Promise<any> {
     const fields: string[] = [];
-    const values: any[] = [id, recruiterId];
-    let idx = 3;
-    if (data.title !== undefined) { fields.push(`title = $${idx++}`); values.push(data.title); }
-    if (data.client !== undefined) { fields.push(`client = $${idx++}`); values.push(data.client); }
-    if (data.location !== undefined) { fields.push(`location = $${idx++}`); values.push(data.location); }
-    if (data.rate !== undefined) { fields.push(`rate = $${idx++}`); values.push(data.rate); }
-    if (data.duration !== undefined) { fields.push(`duration = $${idx++}`); values.push(data.duration); }
-    if (data.description !== undefined) { fields.push(`description = $${idx++}`); values.push(data.description); }
-    if (data.tags !== undefined) { fields.push(`tags = $${idx++}`); values.push(data.tags); }
-    if (data.status !== undefined) { fields.push(`status = $${idx++}`); values.push(data.status); }
+    const values: any[] = [];
+    if (data.title !== undefined) { fields.push('title = ?'); values.push(data.title); }
+    if (data.client !== undefined) { fields.push('client = ?'); values.push(data.client); }
+    if (data.location !== undefined) { fields.push('location = ?'); values.push(data.location); }
+    if (data.rate !== undefined) { fields.push('rate = ?'); values.push(data.rate); }
+    if (data.duration !== undefined) { fields.push('duration = ?'); values.push(data.duration); }
+    if (data.description !== undefined) { fields.push('description = ?'); values.push(data.description); }
+    if (data.tags !== undefined) { fields.push('tags = ?'); values.push(JSON.stringify(data.tags)); }
+    if (data.status !== undefined) { fields.push('status = ?'); values.push(data.status); }
     fields.push('updated_at = NOW()');
-    const result = await pool.query(`UPDATE gigs SET ${fields.join(', ')} WHERE id = $1 AND recruiter_id = $2 RETURNING *`, values);
-    return result.rows[0] || null;
+    const result = await exec(`UPDATE gigs SET ${fields.join(', ')} WHERE id = ? AND recruiter_id = ?`, [...values, id, recruiterId]);
+    if (result.affectedRows === 0) return null;
+    const rows = await q('SELECT * FROM gigs WHERE id = ?', [id]);
+    return rows[0] || null;
   }
 
   async deleteGig(id: number, recruiterId: number): Promise<void> {
-    await pool.query('DELETE FROM gigs WHERE id = $1 AND recruiter_id = $2', [id, recruiterId]);
+    await exec('DELETE FROM gigs WHERE id = ? AND recruiter_id = ?', [id, recruiterId]);
   }
 
   // ── Nostr pubkey helpers ───────────────────────────────────────────────────
   async updateUserNostrPubkey(username: string, pubkey: string): Promise<void> {
-    await pool.query('UPDATE users SET nostr_pubkey = $2, last_updated = NOW() WHERE username = $1', [username, pubkey]);
+    await exec('UPDATE users SET nostr_pubkey = ?, last_updated = NOW() WHERE username = ?', [pubkey, username]);
   }
 
   async getUserNostrPubkey(username: string): Promise<string | null> {
-    const result = await pool.query('SELECT nostr_pubkey FROM users WHERE username = $1', [username]);
-    return result.rows[0]?.nostr_pubkey || null;
+    const rows = await q('SELECT nostr_pubkey FROM users WHERE username = ?', [username]);
+    return rows[0]?.nostr_pubkey || null;
   }
 
   async updateRecruiterNostrPubkey(recruiterId: number, pubkey: string): Promise<void> {
-    await pool.query('UPDATE recruiters SET nostr_pubkey = $2 WHERE id = $1', [recruiterId, pubkey]);
+    await exec('UPDATE recruiters SET nostr_pubkey = ? WHERE id = ?', [pubkey, recruiterId]);
+  }
+
+  // Used by /health/db
+  async ping(): Promise<Date> {
+    const rows = await q("SELECT NOW() AS time");
+    return rows[0].time;
   }
 }
 
